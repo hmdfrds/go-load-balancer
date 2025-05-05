@@ -2,9 +2,11 @@ package main
 
 import (
 	"log"
+	"net"
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Backend struct {
@@ -68,6 +70,41 @@ func (s *ServerPool) GetNextPeer() *Backend {
 
 	log.Printf("No healthy backends available.")
 	return nil
+}
+
+func isBackendAlive(u *url.URL) bool {
+	timeout := 2 * time.Second
+	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+	if err != nil {
+		log.Printf("Backend %s unreachable, error: %s", u.Host, err)
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func healthCheck(pool *ServerPool) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Println("Starting health check pass...")
+		pool.mux.RLock()
+		backendsToCheck := make([]*Backend, len(pool.backends))
+		copy(backendsToCheck, pool.backends)
+		pool.mux.RUnlock()
+
+		var wg sync.WaitGroup
+		for _, backend := range backendsToCheck {
+			wg.Add(1)
+			go func(b *Backend) {
+				defer wg.Done()
+				alive := isBackendAlive(b.URL)
+				pool.MarkBackendStatus(b.URL, alive)
+			}(backend)
+		}
+		wg.Wait()
+		log.Println("Health check pass complete.")
+	}
 }
 
 func main() {
