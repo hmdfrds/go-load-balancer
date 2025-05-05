@@ -3,6 +3,8 @@ package main
 import (
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -107,6 +109,86 @@ func healthCheck(pool *ServerPool) {
 	}
 }
 
+func lb(pool *ServerPool, w http.ResponseWriter, r *http.Request) {
+	peer := pool.GetNextPeer()
+	if peer == nil {
+		log.Printf("Request %s %s: No healthy peers available", r.Method, r.URL.Path)
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	log.Printf("Request %s %s: Routing to backend %s", r.Method, r.URL.Path, peer.URL)
+	proxy := httputil.NewSingleHostReverseProxy(peer.URL)
+
+	proxy.Director = func(r *http.Request) {
+		r.URL.Scheme = peer.URL.Scheme
+		r.URL.Host = peer.URL.Host
+
+		r.Host = peer.URL.Host
+
+		r.Header.Set("X-Real-IP", getIP(r.RemoteAddr))
+		r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+
+		fwdFor := r.Header.Get("X-Forwarded-For")
+		clientIP := getIP(r.RemoteAddr)
+		if fwdFor != "" {
+			fwdFor = fwdFor + ", " + clientIP
+		} else {
+			fwdFor = clientIP
+		}
+		r.Header.Set("X-Forwarded-For", fwdFor)
+		log.Printf("Proxying request for %s to %s%s", r.RemoteAddr, r.URL.Host, r.URL.Path)
+
+	}
+
+	proxy.ErrorHandler = func(ew http.ResponseWriter, er *http.Request, err error) {
+		log.Printf("Proxy error: Backend %s - %v", peer.URL, err)
+		http.Error(ew, "Bad Gateway", http.StatusBadGateway)
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func getIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
 func main() {
+	backendUrls := []string{
+		"http://localhost:9001",
+		"http://localhost:9002",
+	}
+
+	listenAddr := ":8080" // load balancer port
+
+	pool := ServerPool{}
+
+	log.Println("Configuration backends:")
+	for _, urlStr := range backendUrls {
+		backendUrl, err := url.Parse(urlStr)
+		if err != nil {
+			log.Fatalf("Error parsing backend URL '%s': '%v'", urlStr, err)
+		}
+		backend := &Backend{URL: backendUrl}
+		pool.AddBackend(backend)
+	}
+
+	log.Println("Starting background health checker...")
+	go healthCheck(&pool)
+
+	httpHandler := func(w http.ResponseWriter, r *http.Request) {
+		lb(&pool, w, r)
+	}
+
+	log.Printf("Load Balancer server starting on %s", listenAddr)
+	server := &http.Server{
+		Addr:    listenAddr,
+		Handler: http.HandlerFunc(httpHandler),
+	}
+
+	log.Fatal(server.ListenAndServe())
 
 }
